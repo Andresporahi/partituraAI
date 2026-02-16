@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Partituras AI - Voz a Partitura</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <svg class="logo-icon" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="24" cy="24" r="24" fill="url(#grad1)"/>
+                        <path d="M18 34c-2.2 0-4-1.8-4-4s1.8-4 4-4 4 1.8 4 4-1.8 4-4 4zm14-6c-2.2 0-4-1.8-4-4s1.8-4 4-4 4 1.8 4 4-1.8 4-4 4zM22 30V16l14-4v12" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                        <defs>
+                            <linearGradient id="grad1" x1="0" y1="0" x2="48" y2="48">
+                                <stop offset="0%" stop-color="#6366f1"/>
+                                <stop offset="100%" stop-color="#a855f7"/>
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                    <div>
+                        <h1>Partituras AI</h1>
+                        <p class="subtitle">Convierte tu voz en partituras musicales</p>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main">
+            <!-- Step 1: Upload -->
+            <section class="card upload-section" id="uploadSection">
+                <div class="step-badge">Paso 1</div>
+                <h2>Sube tu audio</h2>
+                <p class="card-description">Arrastra un archivo de audio o haz clic para seleccionar. Soporta WAV, MP3, OGG, FLAC, M4A y WebM.</p>
+
+                <div class="dropzone" id="dropzone">
+                    <input type="file" id="fileInput" accept="audio/*" hidden>
+                    <div class="dropzone-content" id="dropzoneContent">
+                        <svg class="dropzone-icon" viewBox="0 0 64 64" fill="none">
+                            <rect x="8" y="16" width="48" height="36" rx="4" stroke="currentColor" stroke-width="2"/>
+                            <path d="M32 40V24m0 0l-8 8m8-8l8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        <span class="dropzone-text">Arrastra tu archivo aquí</span>
+                        <span class="dropzone-subtext">o haz clic para buscar</span>
+                    </div>
+                    <div class="dropzone-file" id="dropzoneFile" hidden>
+                        <svg class="file-icon" viewBox="0 0 24 24" fill="none">
+                            <path d="M9 18V5l12-2v13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            <circle cx="6" cy="18" r="3" stroke="currentColor" stroke-width="1.5"/>
+                            <circle cx="18" cy="16" r="3" stroke="currentColor" stroke-width="1.5"/>
+                        </svg>
+                        <div class="file-info">
+                            <span class="file-name" id="fileName"></span>
+                            <span class="file-size" id="fileSize"></span>
+                        </div>
+                        <button class="btn-remove" id="btnRemove" title="Quitar archivo">
+                            <svg viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Audio Player -->
+                <div class="audio-player" id="audioPlayer" hidden>
+                    <audio id="audioElement" controls></audio>
+                </div>
+
+                <button class="btn btn-primary btn-lg" id="btnConvert" disabled>
+                    <svg class="btn-icon" viewBox="0 0 24 24" fill="none">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z" fill="currentColor"/>
+                    </svg>
+                    Convertir a Partitura
+                </button>
+            </section>
+
+            <!-- Processing -->
+            <section class="card processing-section" id="processingSection" hidden>
+                <div class="processing-animation">
+                    <div class="spinner"></div>
+                    <div class="processing-waves">
+                        <div class="wave"></div>
+                        <div class="wave"></div>
+                        <div class="wave"></div>
+                        <div class="wave"></div>
+                        <div class="wave"></div>
+                    </div>
+                </div>
+                <h2>Procesando tu audio...</h2>
+                <p class="processing-step" id="processingStep">Analizando frecuencias vocales</p>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+            </section>
+
+            <!-- Results -->
+            <section class="card results-section" id="resultsSection" hidden>
+                <div class="step-badge step-badge-success">Completado</div>
+                <h2>Tu partitura esta lista</h2>
+
+                <div class="stats-grid stats-grid-4">
+                    <div class="stat-card">
+                        <span class="stat-value" id="statDuration">--</span>
+                        <span class="stat-label">Duración (s)</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-value" id="statNotes">--</span>
+                        <span class="stat-label">Notas detectadas</span>
+                    </div>
+                    <div class="stat-card stat-card-accent">
+                        <span class="stat-value" id="statKey">--</span>
+                        <span class="stat-label">Tonalidad</span>
+                    </div>
+                    <div class="stat-card stat-card-accent">
+                        <span class="stat-value" id="statBpm">--</span>
+                        <span class="stat-label">BPM</span>
+                    </div>
+                </div>
+
+                <!-- Score Preview -->
+                <div class="score-preview" id="scorePreview" hidden>
+                    <h3>Vista previa de la partitura</h3>
+                    <div class="score-image-container">
+                        <img id="scoreImage" alt="Partitura generada">
+                    </div>
+                </div>
+
+                <!-- OpenSheetMusicDisplay container -->
+                <div class="osmd-container" id="osmdContainer" hidden>
+                    <h3>Partitura interactiva</h3>
+                    <div id="osmdRender"></div>
+                </div>
+
+                <!-- Downloads -->
+                <div class="downloads">
+                    <h3>Descargar archivos</h3>
+                    <div class="download-grid" id="downloadGrid">
+                    </div>
+                </div>
+
+                <button class="btn btn-outline btn-lg" id="btnNewConversion">
+                    <svg class="btn-icon" viewBox="0 0 24 24" fill="none">
+                        <path d="M12 4v16m8-8H4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                    Nueva conversión
+                </button>
+            </section>
+
+            <!-- Error -->
+            <section class="card error-section" id="errorSection" hidden>
+                <div class="error-icon-wrapper">
+                    <svg class="error-icon" viewBox="0 0 24 24" fill="none">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+                        <path d="M15 9l-6 6M9 9l6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <h2>Ocurrió un error</h2>
+                <p class="error-message" id="errorMessage"></p>
+                <button class="btn btn-outline" id="btnRetry">Intentar de nuevo</button>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Partituras AI &mdash; Convierte audio vocal en notación musical usando inteligencia artificial</p>
+        </footer>
+    </div>
+
+    <!-- OSMD library for rendering MusicXML -->
+    <script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.6/build/opensheetmusicdisplay.min.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>
