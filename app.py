@@ -24,10 +24,12 @@ ALLOWED_EXTENSIONS = {"wav", "mp3", "ogg", "flac", "m4a", "webm"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+PUBLIC_FOLDER = os.path.join(BASE_DIR, "public")
+
 app = Flask(
     __name__,
-    static_folder="public/static",
-    template_folder="public",
+    static_folder=os.path.join(PUBLIC_FOLDER, "static"),
+    template_folder=PUBLIC_FOLDER,
 )
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 CORS(app)
@@ -43,7 +45,7 @@ def allowed_file(filename: str) -> bool:
 
 @app.route("/")
 def index():
-    return send_from_directory("public", "index.html")
+    return send_from_directory(PUBLIC_FOLDER, "index.html")
 
 
 @app.route("/api/upload", methods=["POST"])
