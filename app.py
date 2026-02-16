@@ -1,7 +1,6 @@
 """
-Partituras AI – Servidor local Flask.
-Para desarrollo y ejecución local. En producción (Vercel) se usan las
-serverless functions en api/.
+Partituras AI – Servidor Flask.
+Funciona tanto en desarrollo local como en producción (Railway/Docker).
 """
 
 import os
@@ -12,7 +11,7 @@ from flask import Flask, request, jsonify, send_from_directory, render_template
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-from api.processor import audio_to_midi, midi_to_score
+from processor import audio_to_midi, midi_to_score
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -129,7 +128,9 @@ def preview_file(filename):
 # Punto de entrada
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("RAILWAY_ENVIRONMENT") is None
     print("=" * 60)
-    print("  Partituras AI - http://localhost:5000")
+    print(f"  Partituras AI - http://localhost:{port}")
     print("=" * 60)
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=debug, host="0.0.0.0", port=port)

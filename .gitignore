@@ -6,3 +6,4 @@ uploads/
 output/
 .vercel/
 node_modules/
+.dockerignore

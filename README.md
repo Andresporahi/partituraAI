@@ -38,57 +38,47 @@ python app.py
 
 Abre tu navegador en **http://localhost:5000**
 
-## Deploy en Vercel
+## Deploy en Railway
 
-El proyecto está configurado para deploy automático en Vercel:
+El proyecto incluye un `Dockerfile` listo para Railway:
 
-```bash
-# Instalar Vercel CLI (si no lo tienes)
-npm i -g vercel
-
-# Deploy
-vercel
-```
-
-O simplemente conecta el repositorio de GitHub a Vercel para deploy automático.
+1. Ve a [railway.app](https://railway.app) e inicia sesión con GitHub
+2. Haz clic en **"New Project"** → **"Deploy from GitHub repo"**
+3. Selecciona el repositorio `Andresporahi/partituraAI`
+4. Railway detectará el `Dockerfile` automáticamente
+5. En **Settings → Networking**, haz clic en **"Generate Domain"** para obtener tu URL pública
+6. Listo, tu app estará en línea
 
 ## Estructura del proyecto
 
 ```
 Partituras AI/
-├── app.py                 # Servidor Flask (desarrollo local)
+├── app.py                 # Servidor Flask principal
+├── processor.py           # Lógica de procesamiento de audio
 ├── requirements.txt       # Dependencias Python
-├── vercel.json            # Configuración de Vercel
-├── api/                   # Serverless functions (Vercel)
-│   ├── __init__.py
-│   ├── processor.py       # Lógica de procesamiento compartida
-│   ├── upload.py          # POST /api/upload
-│   └── download.py        # GET /api/download (fallback)
-├── public/                # Archivos estáticos (Vercel)
+├── Dockerfile             # Configuración Docker (Railway)
+├── railway.json           # Configuración Railway
+├── Procfile               # Comando de inicio
+├── public/                # Archivos del frontend
 │   ├── index.html
 │   └── static/
 │       ├── style.css
 │       └── app.js
-├── templates/             # Templates Flask (dev local)
-│   └── index.html
-├── static/                # Static Flask (dev local)
-│   ├── style.css
-│   └── app.js
-├── uploads/               # Audio subidos (temporal, local)
-└── output/                # Archivos generados (temporal, local)
+├── uploads/               # Audio subidos (temporal)
+└── output/                # Archivos generados (temporal)
 ```
 
 ## Tecnologías
 
 | Componente | Tecnología |
 |---|---|
-| Backend | Python, Flask / Vercel Serverless |
+| Backend | Python, Flask, Gunicorn |
 | Detección de pitch | librosa (pYIN) |
 | Generación MIDI | pretty_midi |
 | Generación de partitura | music21 |
 | Renderizado de partitura | OpenSheetMusicDisplay (OSMD) |
 | Frontend | HTML5, CSS3, JavaScript vanilla |
-| Deploy | Vercel |
+| Deploy | Railway (Docker) |
 
 ## Consejos para mejores resultados
 
