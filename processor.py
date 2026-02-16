@@ -14,6 +14,7 @@ from music21 import (
     stream, note, meter, tempo, metadata,
     key as m21key,
 )
+from music21.note import Rest
 
 # ---------------------------------------------------------------------------
 # MODELO CREPE ONNX (carga lazy, una sola vez)
@@ -208,22 +209,41 @@ def hz_to_midi_float(freq):
     return 69.0 + 12.0 * np.log2(freq / 440.0)
 
 
+def detect_onsets(y: np.ndarray, sr: int, hop_length: int) -> np.ndarray:
+    """
+    Detecta los momentos donde comienza una nueva nota usando
+    onset detection de librosa.
+    """
+    onset_frames = librosa.onset.onset_detect(
+        y=y, sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        units="frames",
+    )
+    return onset_frames
+
+
 def extract_stable_notes(f0: np.ndarray, voiced: np.ndarray,
                          has_energy: np.ndarray, hop_length: int,
-                         sr: int) -> list:
+                         sr: int, onset_frames: np.ndarray = None) -> list:
     """
-    Extrae notas de regiones estables de pitch.
+    Extrae notas combinando regiones estables de pitch con onsets.
 
-    Filosofía: una "nota" es una región continua donde:
-    - Hay energía (RMS > umbral)  →  no es silencio real
+    Una "nota" es una región continua donde:
+    - Hay energía (RMS > umbral)
     - Hay pitch confiable (voiced)
     - El MIDI redondeado se mantiene igual
+    - No hay un onset que marque inicio de nota nueva
 
-    Esto ignora vibratos (variaciones < 1 semitono) y portamentos cortos,
-    produciendo muchas menos notas falsas.
+    Los onsets fuerzan un corte de nota incluso si el pitch
+    no cambió (ej: misma nota repetida con articulación).
     """
     frame_dur = hop_length / sr
     n = len(f0)
+
+    onset_set = set()
+    if onset_frames is not None:
+        onset_set = set(onset_frames.tolist())
 
     # Convertir a MIDI redondeado para cada frame
     midi_round = np.full(n, np.nan)
@@ -234,57 +254,56 @@ def extract_stable_notes(f0: np.ndarray, voiced: np.ndarray,
             midi_float[i] = mf
             midi_round[i] = round(mf)
 
-    # Recorrer frames y agrupar regiones con mismo MIDI redondeado
+    # Construir boundaries: cambios de pitch + onsets + voiced/unvoiced
+    boundaries = {0}
+    for i in range(1, n):
+        # Cambio voiced/unvoiced
+        prev_valid = not np.isnan(midi_round[i - 1])
+        curr_valid = not np.isnan(midi_round[i])
+        if prev_valid != curr_valid:
+            boundaries.add(i)
+            continue
+        # Cambio de pitch (> 2 semitonos)
+        if prev_valid and curr_valid:
+            if abs(midi_float[i] - midi_float[i - 1]) > 2.5:
+                boundaries.add(i)
+                continue
+        # Onset detectado (nueva articulación)
+        if i in onset_set and curr_valid:
+            boundaries.add(i)
+
+    boundaries = sorted(boundaries)
+
+    # Procesar cada segmento
     notes = []
-    i = 0
-    while i < n:
-        # Buscar inicio de nota (frame con MIDI válido)
-        if np.isnan(midi_round[i]):
-            i += 1
+    for seg_idx in range(len(boundaries)):
+        start_frame = boundaries[seg_idx]
+        end_frame = (boundaries[seg_idx + 1]
+                     if seg_idx + 1 < len(boundaries) else n)
+        if end_frame <= start_frame:
             continue
 
-        current_midi = midi_round[i]
-        start_frame = i
-        pitch_values = [midi_float[i]]
+        seg_midi = midi_float[start_frame:end_frame]
+        valid_mask = ~np.isnan(seg_midi)
+        if np.sum(valid_mask) < 2:
+            continue
 
-        # Extender mientras el MIDI redondeado sea el mismo
-        j = i + 1
-        gap_frames = 0
-        max_gap = 5  # tolerar hasta 5 frames sin pitch (50ms a 10ms/frame)
+        valid_pitches = seg_midi[valid_mask]
 
-        while j < n:
-            if not np.isnan(midi_round[j]) and midi_round[j] == current_midi:
-                pitch_values.append(midi_float[j])
-                gap_frames = 0
-                j += 1
-            elif np.isnan(midi_round[j]) and gap_frames < max_gap:
-                # Tolerar pequeños gaps (consonantes, respiraciones breves)
-                gap_frames += 1
-                j += 1
-            else:
-                break
-
-        end_frame = j
-
-        # Calcular pitch promedio (media recortada)
-        pv = np.array(pitch_values)
-        if len(pv) >= 4:
-            sp = np.sort(pv)
+        # Pitch promedio (media recortada)
+        if len(valid_pitches) >= 4:
+            sp = np.sort(valid_pitches)
             trim = max(1, len(sp) // 6)
             avg_midi = float(np.mean(sp[trim:-trim]))
         else:
-            avg_midi = float(np.median(pv))
+            avg_midi = float(np.median(valid_pitches))
 
         midi_note = int(np.clip(round(avg_midi), 0, 127))
         start_time = start_frame * frame_dur
         end_time = end_frame * frame_dur
-        duration = end_time - start_time
 
-        # Solo aceptar notas con duración mínima razonable
-        if duration >= 0.08:
+        if (end_time - start_time) >= 0.05:
             notes.append((midi_note, start_time, end_time, avg_midi))
-
-        i = end_frame
 
     return notes
 
@@ -443,15 +462,17 @@ def snap_duration(ql: float) -> float:
 # 10. DETECCIÓN DE TONALIDAD Y CORRECCIÓN
 # ---------------------------------------------------------------------------
 
-def detect_key_from_notes(notes: list) -> dict:
-    """Detecta la tonalidad más probable."""
+def detect_key_from_notes(notes: list, bpm: float = 120.0) -> dict:
+    """Detecta la tonalidad más probable usando duraciones ponderadas."""
     if not notes:
         return {"key": "C major", "key_name": "Do Mayor", "confidence": 0}
 
+    beat_dur = 60.0 / bpm
     s = stream.Stream()
     for midi_num, start, end, *_ in notes:
+        dur_ql = max(0.5, (end - start) / beat_dur)
         n = note.Note(midi_num)
-        n.quarterLength = max(0.5, end - start)
+        n.quarterLength = dur_ql
         s.append(n)
 
     try:
@@ -554,8 +575,13 @@ def audio_to_midi(audio_path: str, midi_path: str,
     # Energía RMS para distinguir silencio real
     has_energy = compute_rms_envelope(y_clean, sr, hop_length, len(f0))
 
-    # Extraer notas estables (la mejora principal)
-    notes = extract_stable_notes(f0, voiced, has_energy, hop_length, sr)
+    # Detección de onsets (inicios de nota por articulación)
+    onset_frames = detect_onsets(y_clean, sr, hop_length)
+
+    # Extraer notas: regiones estables + onsets + RMS
+    notes = extract_stable_notes(
+        f0, voiced, has_energy, hop_length, sr, onset_frames
+    )
 
     # Corrección de octava
     notes = fix_octave_jumps(notes)
@@ -589,22 +615,64 @@ def audio_to_midi(audio_path: str, midi_path: str,
 # GENERACIÓN DE PARTITURA
 # ---------------------------------------------------------------------------
 
+def simplify_notes_for_score(notes_list: list, bpm: float) -> list:
+    """
+    Simplificación final antes de la partitura:
+    - Absorbe gaps pequeños extendiendo la nota anterior
+    - Fusiona notas repetidas consecutivas que quedaron pegadas
+    """
+    if len(notes_list) < 2:
+        return notes_list
+
+    beat_dur = 60.0 / bpm
+    min_rest = beat_dur * 0.4
+
+    simplified = [list(notes_list[0])]
+    for i in range(1, len(notes_list)):
+        curr = list(notes_list[i])
+        prev = simplified[-1]
+        gap = curr[1] - prev[2]
+
+        # Gap demasiado pequeño para ser silencio real
+        if 0 < gap < min_rest:
+            prev[2] = curr[1]
+
+        # Fusionar si misma nota y continua
+        if curr[0] == prev[0] and curr[1] <= prev[2] + 0.01:
+            prev[2] = max(prev[2], curr[2])
+        else:
+            simplified.append(curr)
+
+    return [tuple(n) for n in simplified]
+
+
+def duration_to_ql(dur_seconds: float, bpm: float) -> float:
+    """Convierte duración en segundos a quarter-note length."""
+    return dur_seconds / (60.0 / bpm)
+
+
 def midi_to_score(midi_path: str, output_base: str,
                   detected_bpm: float, notes_list: list) -> dict:
     """
-    Genera partitura fiel a la voz:
-    - Usa offsets temporales reales y deja que music21 distribuya en compases
-    - Solo escribe silencios donde realmente hay silencio (>= 1 corchea)
-    - Duraciones simples: corchea, negra, negra con puntillo, blanca, redonda
-    - Corrección tonal solo para notas claramente desafinadas
+    Genera partitura con análisis detallado:
+    - Tonalidad detectada con duraciones correctas en quarter-notes
+    - Construcción secuencial: nota por nota con silencios explícitos
+    - Métrica 4/4 respetada: duraciones snapped a valores simples
+    - Corrección tonal inteligente
+    - Silencios solo donde realmente hay pausa (>= 1 corchea)
     """
-    key_info = detect_key_from_notes(notes_list)
+    key_info = detect_key_from_notes(notes_list, detected_bpm)
 
     try:
         parts = key_info["key"].split()
-        key_obj = m21key.Key(parts[0], parts[1] if len(parts) > 1 else "major")
+        key_obj = m21key.Key(
+            parts[0], parts[1] if len(parts) > 1 else "major"
+        )
     except Exception:
         key_obj = m21key.Key("C", "major")
+
+    # Simplificar notas antes de escribir
+    notes_list = simplify_notes_for_score(notes_list, detected_bpm)
 
     beat_dur = 60.0 / detected_bpm
 
@@ -618,32 +686,43 @@ def midi_to_score(midi_path: str, output_base: str,
     part.append(meter.TimeSignature("4/4"))
     part.append(tempo.MetronomeMark(number=detected_bpm))
 
-    # Construir la partitura usando offsets reales en quarter-note units
+    # Construcción secuencial con silencios explícitos
+    min_rest_ql = 0.5  # mínimo una corchea para crear silencio
+    current_time = 0.0  # en segundos
+
     for midi_num, start, end, *extra in notes_list:
         avg_midi = extra[0] if extra else float(midi_num)
 
-        # Offset en quarter-notes desde el inicio
-        offset_ql = start / beat_dur
+        # Silencio entre nota anterior y esta nota
+        gap = start - current_time
+        if gap > 0:
+            rest_ql = duration_to_ql(gap, detected_bpm)
+            rest_ql = snap_duration(rest_ql)
+            if rest_ql >= min_rest_ql:
+                r = Rest()
+                r.quarterLength = rest_ql
+                part.append(r)
 
         # Corrección tonal
         corrected = snap_to_key(midi_num, avg_midi, key_obj)
 
-        # Duración en quarter-notes, snapped a valores simples
-        dur_ql = (end - start) / beat_dur
+        # Duración en quarter-notes
+        dur_ql = duration_to_ql(end - start, detected_bpm)
         dur_ql = snap_duration(dur_ql)
 
         n = note.Note(corrected)
         n.quarterLength = dur_ql
-        part.insert(offset_ql, n)
+        part.append(n)
 
-    # Dejar que music21 rellene silencios y distribuya en compases
-    try:
-        part.makeRests(fillGaps=True, inPlace=True)
-        part.makeMeasures(inPlace=True)
-    except Exception:
-        pass
+        current_time = end
 
     s.append(part)
+
+    # Dejar que music21 rellene gaps restantes
+    try:
+        part.makeRests(fillGaps=True, inPlace=True)
+    except Exception:
+        pass
 
     xml_path = output_base + ".musicxml"
     s.write("musicxml", fp=xml_path)
