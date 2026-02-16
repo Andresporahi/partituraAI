@@ -11,7 +11,6 @@ import librosa
 import onnxruntime as ort
 import pretty_midi
 from scipy.ndimage import median_filter
-from scipy.special import softmax
 from music21 import (
     stream, note, meter, tempo, metadata,
     key as m21key, pitch as m21pitch, analysis,
@@ -291,11 +290,12 @@ def group_notes_with_onsets(f0: np.ndarray, voiced_flag: np.ndarray,
         if prev_voiced != curr_voiced:
             segment_boundaries.add(i)
 
-    # Agregar cambios grandes de pitch (> 1.5 semitonos entre frames consecutivos)
+    # Agregar cambios grandes de pitch (> 2.5 semitonos entre frames consecutivos)
+    # Umbral alto para evitar que vibratos/portamentos creen notas falsas
     for i in range(1, n_frames):
         if (voiced_flag[i] and voiced_flag[i-1] and
                 not np.isnan(midi_float[i]) and not np.isnan(midi_float[i-1])):
-            if abs(midi_float[i] - midi_float[i-1]) > 1.5:
+            if abs(midi_float[i] - midi_float[i-1]) > 2.5:
                 segment_boundaries.add(i)
 
     boundaries = sorted(segment_boundaries)
@@ -385,42 +385,55 @@ def fix_octave_jumps_advanced(notes_list: list) -> list:
 # 7. FUSIÓN Y LIMPIEZA DE NOTAS
 # ---------------------------------------------------------------------------
 
-def merge_and_clean_notes(notes_list: list, min_duration: float = 0.08,
-                          merge_gap: float = 0.04) -> list:
+def merge_and_clean_notes(notes_list: list, min_duration: float = 0.12,
+                          merge_gap: float = 0.08) -> list:
     """
-    Fusiona notas iguales consecutivas con micro-silencios y
-    elimina notas demasiado cortas (probablemente ruido).
-    También fusiona notas que difieren por solo 1 semitono si son muy cortas.
+    Fusión y limpieza agresiva para producir notación limpia.
+    - Fusiona notas iguales o casi iguales separadas por gaps pequeños
+    - Absorbe notas muy cortas en sus vecinas
+    - Elimina notas demasiado cortas (ruido, artefactos)
+    - Fusiona notas cercanas en pitch que son muy breves
     """
     if len(notes_list) < 2:
         return notes_list
 
-    # Paso 1: Fusionar notas idénticas con gaps pequeños
-    merged = [notes_list[0]]
+    # Paso 1: Fusionar notas iguales o casi iguales (±1 semitono) con gaps pequeños
+    merged = [list(notes_list[0])]
     for n in notes_list[1:]:
         prev = merged[-1]
         gap = n[1] - prev[2]
-        if n[0] == prev[0] and gap < merge_gap:
-            merged[-1] = (prev[0], prev[1], n[2], prev[3])
+        pitch_diff = abs(n[0] - prev[0])
+        # Fusionar si mismo pitch y gap < 80ms, o pitch cercano y gap < 40ms
+        if (pitch_diff == 0 and gap < merge_gap) or (pitch_diff <= 1 and gap < 0.04):
+            merged[-1] = [prev[0], prev[1], n[2], prev[3]]
         else:
-            merged.append(n)
+            merged.append(list(n))
 
-    # Paso 2: Absorber notas muy cortas (< 50ms) en sus vecinas
+    # Paso 2: Absorber notas muy cortas (< 100ms) en sus vecinas
     cleaned = []
-    for i, n in enumerate(merged):
+    for n in merged:
         dur = n[2] - n[1]
-        if dur < 0.05 and len(cleaned) > 0:
-            # Si difiere por 1-2 semitonos de la anterior, extender la anterior
+        if dur < 0.10 and len(cleaned) > 0:
             prev = cleaned[-1]
             if abs(n[0] - prev[0]) <= 2:
-                cleaned[-1] = (prev[0], prev[1], n[2], prev[3])
+                cleaned[-1][2] = n[2]  # extender la anterior
                 continue
         cleaned.append(n)
 
-    # Paso 3: Filtrar por duración mínima
-    cleaned = [n for n in cleaned if (n[2] - n[1]) >= min_duration]
+    # Paso 3: Segunda pasada de fusión (después de absorber cortas pueden quedar iguales)
+    merged2 = [cleaned[0]]
+    for n in cleaned[1:]:
+        prev = merged2[-1]
+        gap = n[1] - prev[2]
+        if n[0] == prev[0] and gap < merge_gap:
+            merged2[-1][2] = n[2]
+        else:
+            merged2.append(n)
 
-    return cleaned
+    # Paso 4: Filtrar por duración mínima
+    result = [tuple(n) for n in merged2 if (n[2] - n[1]) >= min_duration]
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -456,10 +469,11 @@ def detect_tempo_precise(y: np.ndarray, sr: int) -> float:
 # ---------------------------------------------------------------------------
 
 def quantize_to_beat_grid(notes_list: list, bpm: float,
-                          grid_subdivision: int = 8) -> list:
+                          grid_subdivision: int = 4) -> list:
     """
     Cuantiza los tiempos de inicio y fin de las notas a una rejilla
-    basada en el tempo real. grid_subdivision=8 → fusas (1/8 de beat).
+    basada en el tempo real. grid_subdivision=4 → semicorcheas (1/4 de beat).
+    Usar 4 en vez de 8 produce notación mucho más limpia.
     """
     beat_duration = 60.0 / bpm
     grid_size = beat_duration / grid_subdivision
@@ -475,6 +489,19 @@ def quantize_to_beat_grid(notes_list: list, bpm: float,
 
         quantized.append((midi_num, q_start, q_end, avg_midi))
 
+    # Eliminar notas duplicadas en el mismo punto de la rejilla
+    if len(quantized) > 1:
+        deduped = [quantized[0]]
+        for n in quantized[1:]:
+            prev = deduped[-1]
+            if n[1] == prev[1] and n[2] == prev[2]:
+                continue  # nota duplicada en misma posición
+            if n[0] == prev[0] and n[1] <= prev[2]:
+                deduped[-1] = (prev[0], prev[1], max(prev[2], n[2]), prev[3])
+                continue
+            deduped.append(n)
+        quantized = deduped
+
     return quantized
 
 
@@ -487,21 +514,17 @@ def duration_to_quarter_length(dur_seconds: float, bpm: float) -> float:
 def snap_quarter_length(ql: float) -> float:
     """
     Ajusta un quarter-length a la duración musical más cercana.
-    Incluye valores normales, con puntillo y tresillos.
+    Solo valores simples: sin tresillos para notación limpia.
+    Mínimo una corchea (0.5) para evitar notas demasiado cortas.
     """
     valid = [
-        0.25,       # semicorchea
-        0.375,      # semicorchea con puntillo
-        1/3,        # tresillo de corchea
         0.5,        # corchea
         0.75,       # corchea con puntillo
-        2/3,        # tresillo de negra
         1.0,        # negra
         1.5,        # negra con puntillo
         2.0,        # blanca
         3.0,        # blanca con puntillo
         4.0,        # redonda
-        6.0,        # redonda con puntillo
     ]
     return min(valid, key=lambda v: abs(v - ql))
 
@@ -674,14 +697,49 @@ def audio_to_midi(audio_path: str, midi_path: str) -> dict:
     }
 
 
+def simplify_notes_for_score(notes_list: list, bpm: float) -> list:
+    """
+    Simplificación final antes de generar la partitura:
+    - Elimina gaps pequeños entre notas (los absorbe extendiendo la nota anterior)
+    - Fusiona notas repetidas consecutivas
+    - Asegura que las duraciones sean musicalmente razonables
+    """
+    if len(notes_list) < 2:
+        return notes_list
+
+    beat_dur = 60.0 / bpm
+    min_rest_dur = beat_dur * 0.4  # mínimo ~una corchea para crear un silencio
+
+    simplified = [list(notes_list[0])]
+
+    for i in range(1, len(notes_list)):
+        curr = list(notes_list[i])
+        prev = simplified[-1]
+        gap = curr[1] - prev[2]
+
+        if gap > 0 and gap < min_rest_dur:
+            # Gap demasiado pequeño para ser un silencio real:
+            # extender la nota anterior hasta el inicio de la siguiente
+            prev[2] = curr[1]
+
+        # Fusionar si misma nota y continua
+        if curr[0] == prev[0] and curr[1] <= prev[2] + 0.01:
+            prev[2] = max(prev[2], curr[2])
+        else:
+            simplified.append(curr)
+
+    return [tuple(n) for n in simplified]
+
+
 def midi_to_score(midi_path: str, output_base: str,
                   detected_bpm: float, notes_list: list) -> dict:
     """
-    Genera partitura con:
+    Genera partitura limpia con:
     - Tonalidad detectada automáticamente
     - Corrección tonal inteligente (solo notas ambiguas)
-    - Cuantización rítmica a valores musicales reales
-    - Silencios explícitos
+    - Cuantización rítmica a valores musicales simples (sin tresillos)
+    - Silencios solo donde realmente hay silencio (gaps grandes)
+    - Notación legible: mínimo corcheas, máximo redondas
     """
     key_info = detect_key_from_notes(notes_list)
 
@@ -690,6 +748,9 @@ def midi_to_score(midi_path: str, output_base: str,
         key_obj = m21key.Key(parts[0], parts[1] if len(parts) > 1 else "major")
     except Exception:
         key_obj = m21key.Key("C", "major")
+
+    # Simplificar notas antes de escribir la partitura
+    notes_list = simplify_notes_for_score(notes_list, detected_bpm)
 
     s = stream.Score()
     s.metadata = metadata.Metadata()
@@ -701,17 +762,19 @@ def midi_to_score(midi_path: str, output_base: str,
     part.append(meter.TimeSignature("4/4"))
     part.append(tempo.MetronomeMark(number=detected_bpm))
 
+    beat_dur = 60.0 / detected_bpm
+    min_rest_ql = 0.5  # mínimo una corchea de silencio
     current_time = 0.0
 
     for midi_num, start, end, *extra in notes_list:
         avg_midi = extra[0] if extra else float(midi_num)
 
-        # Silencio entre notas
+        # Silencio entre notas: solo si es suficientemente largo
         gap = start - current_time
-        if gap > 0.05:
+        if gap > 0:
             rest_ql = duration_to_quarter_length(gap, detected_bpm)
             rest_ql = snap_quarter_length(rest_ql)
-            if rest_ql >= 0.25:
+            if rest_ql >= min_rest_ql:
                 r = Rest()
                 r.quarterLength = rest_ql
                 part.append(r)
@@ -719,7 +782,7 @@ def midi_to_score(midi_path: str, output_base: str,
         # Corrección tonal inteligente
         corrected_midi = snap_to_key_smart(midi_num, avg_midi, key_obj)
 
-        # Duración cuantizada
+        # Duración cuantizada a valores simples
         dur_seconds = end - start
         dur_ql = duration_to_quarter_length(dur_seconds, detected_bpm)
         dur_ql = snap_quarter_length(dur_ql)
@@ -731,6 +794,12 @@ def midi_to_score(midi_path: str, output_base: str,
         current_time = end
 
     s.append(part)
+
+    # Usar music21 para hacer la partitura más legible
+    try:
+        part.makeRests(fillGaps=True, inPlace=True)
+    except Exception:
+        pass
 
     xml_path = output_base + ".musicxml"
     s.write("musicxml", fp=xml_path)
