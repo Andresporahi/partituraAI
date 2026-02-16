@@ -4,11 +4,6 @@ Funciona tanto en desarrollo local como en producción (Railway/Docker).
 """
 
 import os
-
-# Suprimir warnings de TensorFlow antes de importar cualquier cosa
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-
 import uuid
 import traceback
 

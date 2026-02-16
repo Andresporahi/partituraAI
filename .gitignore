@@ -7,3 +7,5 @@ output/
 .vercel/
 node_modules/
 .dockerignore
+crepe_saved_model/
+*.tflite

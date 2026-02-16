@@ -1,20 +1,39 @@
 """
 Módulo de procesamiento de audio: detección de pitch, generación MIDI y partitura.
 Pipeline de alta precisión para transcripción de voz monofónica.
-Usa CREPE (red neuronal) para detección de pitch estado del arte.
+Usa CREPE (red neuronal vía ONNX Runtime) para detección de pitch estado del arte.
+Sin TensorFlow: solo ONNX Runtime (~50MB RAM vs ~500MB).
 """
 
 import os
 import numpy as np
 import librosa
-import crepe
+import onnxruntime as ort
 import pretty_midi
 from scipy.ndimage import median_filter
+from scipy.special import softmax
 from music21 import (
     stream, note, meter, tempo, metadata,
     key as m21key, pitch as m21pitch, analysis,
 )
 from music21.note import Rest
+
+# ---------------------------------------------------------------------------
+# MODELO CREPE ONNX (carga lazy, una sola vez)
+# ---------------------------------------------------------------------------
+_CREPE_SESSION = None
+_CREPE_CENTS = np.arange(360) * 20 + 1997.3794084376191  # bins de CREPE
+
+def _get_crepe_session():
+    """Carga el modelo CREPE ONNX una sola vez (singleton)."""
+    global _CREPE_SESSION
+    if _CREPE_SESSION is None:
+        model_path = os.path.join(os.path.dirname(__file__), "models", "crepe_small.onnx")
+        opts = ort.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 2
+        _CREPE_SESSION = ort.InferenceSession(model_path, opts)
+    return _CREPE_SESSION
 
 
 # ---------------------------------------------------------------------------
@@ -42,44 +61,152 @@ def preprocess_audio(y: np.ndarray, sr: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# 2. DETECCIÓN DE PITCH CON CREPE (RED NEURONAL)
+# 2. DETECCIÓN DE PITCH CON CREPE (ONNX RUNTIME)
 # ---------------------------------------------------------------------------
+
+def _viterbi_decode(probs: np.ndarray) -> np.ndarray:
+    """
+    Decodificación Viterbi simplificada para suavizar la secuencia de pitch.
+    Usa un modelo de transición que penaliza saltos grandes entre frames.
+    """
+    n_frames, n_bins = probs.shape
+    log_probs = np.log(probs + 1e-10)
+
+    # Matriz de transición: penalizar saltos grandes (gaussiana centrada)
+    max_transition = 12  # máximo salto en bins (240 cents)
+    transition = np.zeros(n_bins)
+    for i in range(n_bins):
+        d = min(i, n_bins - i)
+        if d <= max_transition:
+            transition[i] = np.exp(-0.5 * (d / 4.0) ** 2)
+    transition /= transition.sum()
+    log_transition = np.log(transition + 1e-10)
+
+    # Forward pass
+    viterbi = np.zeros((n_frames, n_bins))
+    backptr = np.zeros((n_frames, n_bins), dtype=int)
+    viterbi[0] = log_probs[0]
+
+    for t in range(1, n_frames):
+        for j in range(n_bins):
+            trans_scores = viterbi[t - 1] + np.roll(log_transition, j)
+            backptr[t, j] = np.argmax(trans_scores)
+            viterbi[t, j] = trans_scores[backptr[t, j]] + log_probs[t, j]
+
+    # Backtrack
+    path = np.zeros(n_frames, dtype=int)
+    path[-1] = np.argmax(viterbi[-1])
+    for t in range(n_frames - 2, -1, -1):
+        path[t] = backptr[t + 1, path[t + 1]]
+
+    return path
+
 
 def detect_pitch_crepe(y: np.ndarray, sr: int) -> tuple:
     """
-    Detección de pitch usando CREPE, una red neuronal convolucional
-    entrenada específicamente para pitch monofónico.
-    Mucho más preciso que pYIN, especialmente para voz humana.
+    Detección de pitch usando CREPE vía ONNX Runtime.
+    Sin TensorFlow: usa solo ~50MB RAM.
 
-    Usa modelo 'small' para balance entre precisión y velocidad.
-    Viterbi activado para suavizado HMM de la curva de pitch.
-    step_size=10ms para alta resolución temporal.
+    Pipeline:
+    1. Resamplear a 16kHz (CREPE fue entrenado con 16kHz)
+    2. Dividir en frames de 1024 samples con step de 160 (10ms)
+    3. Inferencia ONNX por lotes
+    4. Decodificación weighted average de frecuencia
+    5. Viterbi para suavizado temporal
     """
-    step_size_ms = 10  # 10ms entre frames
+    step_size_ms = 10
+    crepe_sr = 16000
+    frame_size = 1024
+    step_samples = int(crepe_sr * step_size_ms / 1000)  # 160
 
-    # CREPE espera audio como int16 o float32
-    # Resamplear a 16kHz internamente si es necesario (CREPE lo hace solo)
-    time_arr, frequency, confidence, _ = crepe.predict(
-        y, sr,
-        model_capacity='small',
-        viterbi=True,       # suavizado HMM para continuidad de pitch
-        step_size=step_size_ms,
-        verbose=0,
-    )
+    # Resamplear a 16kHz si es necesario
+    if sr != crepe_sr:
+        y_16k = librosa.resample(y, orig_sr=sr, target_sr=crepe_sr)
+    else:
+        y_16k = y.copy()
 
-    # Calcular hop_length equivalente para compatibilidad con el resto del pipeline
-    hop_length = int(sr * step_size_ms / 1000)  # 220 samples a 22050Hz
+    y_16k = y_16k.astype(np.float32)
 
-    # Construir voiced_flag basado en confianza de CREPE
+    # Crear frames de 1024 samples con paso de 160
+    n_samples = len(y_16k)
+    n_frames = max(1, 1 + (n_samples - frame_size) // step_samples)
+
+    frames = np.zeros((n_frames, frame_size), dtype=np.float32)
+    for i in range(n_frames):
+        start = i * step_samples
+        end = start + frame_size
+        if end <= n_samples:
+            frames[i] = y_16k[start:end]
+        else:
+            available = n_samples - start
+            if available > 0:
+                frames[i, :available] = y_16k[start:]
+
+    # Normalizar cada frame (como hace CREPE original)
+    frame_norms = np.max(np.abs(frames), axis=1, keepdims=True)
+    frame_norms = np.maximum(frame_norms, 1e-8)
+    frames = frames / frame_norms
+
+    # Inferencia ONNX por lotes
+    session = _get_crepe_session()
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+
+    batch_size = 128
+    all_probs = []
+    for i in range(0, n_frames, batch_size):
+        batch = frames[i:i + batch_size]
+        result = session.run([output_name], {input_name: batch})[0]
+        all_probs.append(result)
+
+    probs = np.vstack(all_probs)  # (n_frames, 360)
+
+    # Confianza: máximo de la distribución de probabilidad
+    confidence = np.max(probs, axis=1)
+
+    # Decodificar frecuencia con media ponderada (más preciso que argmax)
+    frequency = np.zeros(n_frames)
+    for i in range(n_frames):
+        p = probs[i]
+        center = np.argmax(p)
+        # Usar ventana local alrededor del pico para media ponderada
+        start_bin = max(0, center - 4)
+        end_bin = min(360, center + 5)
+        local_p = p[start_bin:end_bin]
+        local_cents = _CREPE_CENTS[start_bin:end_bin]
+        if np.sum(local_p) > 0:
+            predicted_cents = np.sum(local_p * local_cents) / np.sum(local_p)
+        else:
+            predicted_cents = _CREPE_CENTS[center]
+        frequency[i] = 10.0 * 2.0 ** (predicted_cents / 1200.0)
+
+    # Aplicar Viterbi para suavizar la secuencia de pitch
+    if n_frames > 2:
+        viterbi_path = _viterbi_decode(probs)
+        for i in range(n_frames):
+            center = viterbi_path[i]
+            start_bin = max(0, center - 4)
+            end_bin = min(360, center + 5)
+            local_p = probs[i, start_bin:end_bin]
+            local_cents = _CREPE_CENTS[start_bin:end_bin]
+            if np.sum(local_p) > 0:
+                predicted_cents = np.sum(local_p * local_cents) / np.sum(local_p)
+            else:
+                predicted_cents = _CREPE_CENTS[center]
+            frequency[i] = 10.0 * 2.0 ** (predicted_cents / 1200.0)
+
+    # hop_length equivalente para el pipeline (en samples del sr original)
+    hop_length = int(sr * step_size_ms / 1000)
+
+    # Voiced flag basado en confianza
     confidence_threshold = 0.5
     voiced_flag = confidence >= confidence_threshold
 
-    # Convertir frecuencias a f0 array compatible (NaN donde no hay voz)
+    # f0 array compatible
     f0 = frequency.copy().astype(np.float64)
     f0[~voiced_flag] = np.nan
     f0[f0 <= 0] = np.nan
 
-    # voiced_prob es directamente la confianza de CREPE (0-1)
     voiced_prob = confidence.copy()
 
     return f0, voiced_flag, voiced_prob, hop_length

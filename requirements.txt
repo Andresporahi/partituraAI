@@ -8,8 +8,4 @@ pretty_midi>=0.2.10
 music21>=9.1
 soundfile>=0.12
 werkzeug>=3.0
-setuptools<81
-tensorflow-cpu>=2.13
-crepe>=0.0.16
-hmmlearn>=0.3
-resampy>=0.4
+onnxruntime>=1.16
