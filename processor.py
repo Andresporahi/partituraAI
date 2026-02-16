@@ -1,14 +1,15 @@
 """
 Módulo de procesamiento de audio: detección de pitch, generación MIDI y partitura.
 Pipeline de alta precisión para transcripción de voz monofónica.
+Usa CREPE (red neuronal) para detección de pitch estado del arte.
 """
 
 import os
 import numpy as np
 import librosa
+import crepe
 import pretty_midi
 from scipy.ndimage import median_filter
-from scipy.signal import savgol_filter
 from music21 import (
     stream, note, meter, tempo, metadata,
     key as m21key, pitch as m21pitch, analysis,
@@ -41,64 +42,69 @@ def preprocess_audio(y: np.ndarray, sr: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# 2. DETECCIÓN DE PITCH DE ALTA PRECISIÓN
+# 2. DETECCIÓN DE PITCH CON CREPE (RED NEURONAL)
 # ---------------------------------------------------------------------------
 
-def detect_pitch_precise(y: np.ndarray, sr: int) -> tuple:
+def detect_pitch_crepe(y: np.ndarray, sr: int) -> tuple:
     """
-    Detección de pitch con resolución temporal fina y filtrado por confianza.
-    Usa hop_length pequeño para mayor resolución temporal.
-    """
-    hop_length = 256  # Más fino que el default de 512 → ~11.6ms por frame
+    Detección de pitch usando CREPE, una red neuronal convolucional
+    entrenada específicamente para pitch monofónico.
+    Mucho más preciso que pYIN, especialmente para voz humana.
 
-    f0, voiced_flag, voiced_prob = librosa.pyin(
-        y,
-        fmin=librosa.note_to_hz("C2"),   # ~65 Hz
-        fmax=librosa.note_to_hz("C6"),   # ~1047 Hz (rango vocal realista)
-        sr=sr,
-        hop_length=hop_length,
-        fill_na=np.nan,
+    Usa modelo 'small' para balance entre precisión y velocidad.
+    Viterbi activado para suavizado HMM de la curva de pitch.
+    step_size=10ms para alta resolución temporal.
+    """
+    step_size_ms = 10  # 10ms entre frames
+
+    # CREPE espera audio como int16 o float32
+    # Resamplear a 16kHz internamente si es necesario (CREPE lo hace solo)
+    time_arr, frequency, confidence, _ = crepe.predict(
+        y, sr,
+        model_capacity='small',
+        viterbi=True,       # suavizado HMM para continuidad de pitch
+        step_size=step_size_ms,
+        verbose=0,
     )
 
-    # Filtrar por umbral de confianza: solo aceptar frames con alta probabilidad
-    confidence_threshold = 0.3
-    low_confidence = voiced_prob < confidence_threshold
-    voiced_flag[low_confidence] = False
+    # Calcular hop_length equivalente para compatibilidad con el resto del pipeline
+    hop_length = int(sr * step_size_ms / 1000)  # 220 samples a 22050Hz
+
+    # Construir voiced_flag basado en confianza de CREPE
+    confidence_threshold = 0.5
+    voiced_flag = confidence >= confidence_threshold
+
+    # Convertir frecuencias a f0 array compatible (NaN donde no hay voz)
+    f0 = frequency.copy().astype(np.float64)
+    f0[~voiced_flag] = np.nan
+    f0[f0 <= 0] = np.nan
+
+    # voiced_prob es directamente la confianza de CREPE (0-1)
+    voiced_prob = confidence.copy()
 
     return f0, voiced_flag, voiced_prob, hop_length
 
 
 # ---------------------------------------------------------------------------
-# 3. SUAVIZADO DE PITCH AVANZADO
+# 3. SUAVIZADO DE PITCH LIGERO (POST-CREPE)
 # ---------------------------------------------------------------------------
 
-def smooth_pitch_advanced(f0: np.ndarray, voiced_flag: np.ndarray) -> np.ndarray:
+def smooth_pitch_post_crepe(f0: np.ndarray, voiced_flag: np.ndarray) -> np.ndarray:
     """
-    Suavizado de pitch en dos etapas:
-    1. Filtro de mediana (elimina glitches puntuales)
-    2. Filtro Savitzky-Golay (suaviza sin perder transiciones reales)
+    Suavizado ligero post-CREPE. Como CREPE con Viterbi ya aplica
+    suavizado HMM, solo hacemos un filtro de mediana pequeño para
+    eliminar cualquier outlier residual sin destruir transiciones.
     """
     f0_clean = f0.copy()
     voiced_mask = voiced_flag & ~np.isnan(f0)
 
-    if np.sum(voiced_mask) < 7:
+    if np.sum(voiced_mask) < 5:
         return f0_clean
 
     voiced_freqs = f0_clean[voiced_mask]
+    smoothed = median_filter(voiced_freqs, size=3)
+    f0_clean[voiced_mask] = smoothed
 
-    # Etapa 1: Mediana para eliminar outliers
-    median_smoothed = median_filter(voiced_freqs, size=5)
-
-    # Etapa 2: Savitzky-Golay para suavizar curva manteniendo transiciones
-    window = min(11, len(median_smoothed))
-    if window % 2 == 0:
-        window -= 1
-    if window >= 5:
-        sg_smoothed = savgol_filter(median_smoothed, window_length=window, polyorder=3)
-    else:
-        sg_smoothed = median_smoothed
-
-    f0_clean[voiced_mask] = sg_smoothed
     return f0_clean
 
 
@@ -475,10 +481,10 @@ def snap_to_key_smart(midi_num: int, avg_midi: float, key_obj,
 
 def audio_to_midi(audio_path: str, midi_path: str) -> dict:
     """
-    Pipeline de alta precisión:
+    Pipeline de alta precisión con CREPE:
     1. Preprocesamiento de audio
-    2. Detección de pitch con resolución fina
-    3. Suavizado avanzado (mediana + Savitzky-Golay)
+    2. Detección de pitch con CREPE (red neuronal + Viterbi HMM)
+    3. Suavizado ligero post-CREPE
     4. Detección de onsets
     5. Agrupación inteligente por segmentos
     6. Corrección de octava con contexto amplio
@@ -495,11 +501,11 @@ def audio_to_midi(audio_path: str, midi_path: str) -> dict:
     # 2. Detectar tempo
     detected_bpm = detect_tempo_precise(y_clean, sr)
 
-    # 3. Detección de pitch de alta resolución
-    f0, voiced_flag, voiced_prob, hop_length = detect_pitch_precise(y_clean, sr)
+    # 3. Detección de pitch con CREPE (red neuronal)
+    f0, voiced_flag, voiced_prob, hop_length = detect_pitch_crepe(y_clean, sr)
 
-    # 4. Suavizado avanzado
-    f0 = smooth_pitch_advanced(f0, voiced_flag)
+    # 4. Suavizado ligero (CREPE+Viterbi ya suaviza, solo limpiamos outliers)
+    f0 = smooth_pitch_post_crepe(f0, voiced_flag)
 
     # 5. Detección de onsets
     onset_frames = detect_onsets(y_clean, sr, hop_length)
