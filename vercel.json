@@ -5,7 +5,9 @@
       "src": "api/upload.py",
       "use": "@vercel/python",
       "config": {
-        "maxLambdaSize": "250mb"
+        "maxLambdaSize": "250mb",
+        "memory": 1024,
+        "maxDuration": 60
       }
     },
     {
@@ -23,11 +25,5 @@
     { "src": "/api/preview/(.*)", "dest": "/api/download.py?filename=$1&preview=1" },
     { "src": "/static/(.*)", "dest": "/public/static/$1" },
     { "src": "/(.*)", "dest": "/public/$1" }
-  ],
-  "functions": {
-    "api/upload.py": {
-      "memory": 1024,
-      "maxDuration": 60
-    }
-  }
+  ]
 }
