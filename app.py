@@ -129,8 +129,15 @@ def preview_file(filename):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("RAILWAY_ENVIRONMENT") is None
+    is_production = os.environ.get("RAILWAY_ENVIRONMENT") is not None
+
     print("=" * 60)
     print(f"  Partituras AI - http://localhost:{port}")
     print("=" * 60)
-    app.run(debug=debug, host="0.0.0.0", port=port)
+
+    if is_production:
+        from waitress import serve
+        print(f"  Modo producción (waitress) en puerto {port}")
+        serve(app, host="0.0.0.0", port=port)
+    else:
+        app.run(debug=True, host="0.0.0.0", port=port)
