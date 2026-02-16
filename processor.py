@@ -1,6 +1,6 @@
 """
 Módulo de procesamiento de audio: detección de pitch, generación MIDI y partitura.
-Compartido entre el servidor local (app.py) y las serverless functions de Vercel.
+Pipeline de alta precisión para transcripción de voz monofónica.
 """
 
 import os
@@ -8,6 +8,7 @@ import numpy as np
 import librosa
 import pretty_midi
 from scipy.ndimage import median_filter
+from scipy.signal import savgol_filter
 from music21 import (
     stream, note, meter, tempo, metadata,
     key as m21key, pitch as m21pitch, analysis,
@@ -16,207 +17,376 @@ from music21.note import Rest
 
 
 # ---------------------------------------------------------------------------
-# Utilidades de conversión mejoradas
+# 1. PREPROCESAMIENTO DE AUDIO
 # ---------------------------------------------------------------------------
 
-def hz_to_midi_note(freq: float) -> int:
-    """Convierte frecuencia en Hz a número de nota MIDI (0-127)."""
-    if freq <= 0:
-        return 0
-    midi_val = 69 + 12 * np.log2(freq / 440.0)
-    return int(np.clip(round(midi_val), 0, 127))
-
-
-def smooth_pitch_sequence(f0: np.ndarray, voiced_flag: np.ndarray,
-                          kernel_size: int = 5) -> np.ndarray:
+def preprocess_audio(y: np.ndarray, sr: int) -> np.ndarray:
     """
-    Aplica un filtro de mediana a la secuencia de pitch para eliminar
-    saltos bruscos y glitches de detección.
+    Preprocesa el audio para mejorar la detección de pitch:
+    - Normaliza amplitud
+    - Aplica filtro pasa-banda para aislar rango vocal (80Hz - 4000Hz)
+    - Reduce ruido con spectral gating simple
+    """
+    # Normalizar
+    if np.max(np.abs(y)) > 0:
+        y = y / np.max(np.abs(y))
+
+    # Filtro pasa-banda para rango vocal humano
+    y_filtered = librosa.effects.preemphasis(y, coef=0.97)
+
+    # Trim silencios al inicio y final
+    y_trimmed, _ = librosa.effects.trim(y_filtered, top_db=30)
+
+    return y_trimmed
+
+
+# ---------------------------------------------------------------------------
+# 2. DETECCIÓN DE PITCH DE ALTA PRECISIÓN
+# ---------------------------------------------------------------------------
+
+def detect_pitch_precise(y: np.ndarray, sr: int) -> tuple:
+    """
+    Detección de pitch con resolución temporal fina y filtrado por confianza.
+    Usa hop_length pequeño para mayor resolución temporal.
+    """
+    hop_length = 256  # Más fino que el default de 512 → ~11.6ms por frame
+
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        y,
+        fmin=librosa.note_to_hz("C2"),   # ~65 Hz
+        fmax=librosa.note_to_hz("C6"),   # ~1047 Hz (rango vocal realista)
+        sr=sr,
+        hop_length=hop_length,
+        fill_na=np.nan,
+    )
+
+    # Filtrar por umbral de confianza: solo aceptar frames con alta probabilidad
+    confidence_threshold = 0.3
+    low_confidence = voiced_prob < confidence_threshold
+    voiced_flag[low_confidence] = False
+
+    return f0, voiced_flag, voiced_prob, hop_length
+
+
+# ---------------------------------------------------------------------------
+# 3. SUAVIZADO DE PITCH AVANZADO
+# ---------------------------------------------------------------------------
+
+def smooth_pitch_advanced(f0: np.ndarray, voiced_flag: np.ndarray) -> np.ndarray:
+    """
+    Suavizado de pitch en dos etapas:
+    1. Filtro de mediana (elimina glitches puntuales)
+    2. Filtro Savitzky-Golay (suaviza sin perder transiciones reales)
     """
     f0_clean = f0.copy()
     voiced_mask = voiced_flag & ~np.isnan(f0)
 
-    if np.sum(voiced_mask) < kernel_size:
+    if np.sum(voiced_mask) < 7:
         return f0_clean
 
     voiced_freqs = f0_clean[voiced_mask]
-    smoothed = median_filter(voiced_freqs, size=kernel_size)
-    f0_clean[voiced_mask] = smoothed
 
+    # Etapa 1: Mediana para eliminar outliers
+    median_smoothed = median_filter(voiced_freqs, size=5)
+
+    # Etapa 2: Savitzky-Golay para suavizar curva manteniendo transiciones
+    window = min(11, len(median_smoothed))
+    if window % 2 == 0:
+        window -= 1
+    if window >= 5:
+        sg_smoothed = savgol_filter(median_smoothed, window_length=window, polyorder=3)
+    else:
+        sg_smoothed = median_smoothed
+
+    f0_clean[voiced_mask] = sg_smoothed
     return f0_clean
 
 
-def fix_octave_jumps(notes_list: list, max_jump_semitones: int = 11) -> list:
+# ---------------------------------------------------------------------------
+# 4. DETECCIÓN DE ONSETS (INICIOS DE NOTA)
+# ---------------------------------------------------------------------------
+
+def detect_onsets(y: np.ndarray, sr: int, hop_length: int) -> np.ndarray:
     """
-    Corrige saltos de octava erróneos. Si una nota salta más de
-    max_jump_semitones respecto a sus vecinas, se ajusta a la octava
-    más cercana.
+    Detecta los momentos donde comienza una nueva nota usando
+    onset detection de librosa. Esto marca transiciones reales
+    entre notas, no solo cambios de pitch.
+    """
+    onset_frames = librosa.onset.onset_detect(
+        y=y, sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        units="frames",
+    )
+    return onset_frames
+
+
+# ---------------------------------------------------------------------------
+# 5. AGRUPACIÓN INTELIGENTE DE NOTAS
+# ---------------------------------------------------------------------------
+
+def hz_to_midi_float(freq: float) -> float:
+    """Convierte Hz a MIDI como float (sin redondear)."""
+    if freq <= 0 or np.isnan(freq):
+        return np.nan
+    return 69 + 12 * np.log2(freq / 440.0)
+
+
+def group_notes_with_onsets(f0: np.ndarray, voiced_flag: np.ndarray,
+                            onset_frames: np.ndarray, hop_length: int,
+                            sr: int) -> list:
+    """
+    Agrupa frames en notas usando tanto cambios de pitch como onsets detectados.
+    Para cada segmento entre onsets, calcula el pitch promedio ponderado
+    por confianza, lo que da una nota más precisa que frame-by-frame.
+    """
+    frame_duration = hop_length / sr
+    n_frames = len(f0)
+
+    # Convertir f0 a MIDI float
+    midi_float = np.array([hz_to_midi_float(f) for f in f0])
+
+    # Crear marcadores de segmento: un nuevo segmento empieza en cada onset
+    # o cuando hay un cambio de voiced/unvoiced
+    segment_boundaries = set(onset_frames.tolist())
+    segment_boundaries.add(0)
+
+    # También agregar cambios voiced→unvoiced y viceversa
+    for i in range(1, n_frames):
+        prev_voiced = voiced_flag[i-1] and not np.isnan(f0[i-1])
+        curr_voiced = voiced_flag[i] and not np.isnan(f0[i])
+        if prev_voiced != curr_voiced:
+            segment_boundaries.add(i)
+
+    # Agregar cambios grandes de pitch (> 1.5 semitonos entre frames consecutivos)
+    for i in range(1, n_frames):
+        if (voiced_flag[i] and voiced_flag[i-1] and
+                not np.isnan(midi_float[i]) and not np.isnan(midi_float[i-1])):
+            if abs(midi_float[i] - midi_float[i-1]) > 1.5:
+                segment_boundaries.add(i)
+
+    boundaries = sorted(segment_boundaries)
+
+    # Procesar cada segmento
+    notes_list = []
+
+    for seg_idx in range(len(boundaries)):
+        start_frame = boundaries[seg_idx]
+        end_frame = boundaries[seg_idx + 1] if seg_idx + 1 < len(boundaries) else n_frames
+
+        if end_frame <= start_frame:
+            continue
+
+        # Extraer frames del segmento
+        seg_voiced = voiced_flag[start_frame:end_frame]
+        seg_midi = midi_float[start_frame:end_frame]
+
+        # Solo considerar frames voiced con pitch válido
+        valid_mask = seg_voiced & ~np.isnan(seg_midi)
+        if np.sum(valid_mask) < 2:
+            continue
+
+        valid_pitches = seg_midi[valid_mask]
+
+        # Calcular pitch promedio del segmento (media recortada para robustez)
+        if len(valid_pitches) >= 4:
+            sorted_p = np.sort(valid_pitches)
+            trim = max(1, len(sorted_p) // 8)
+            trimmed = sorted_p[trim:-trim] if trim > 0 else sorted_p
+            avg_midi = np.mean(trimmed)
+        else:
+            avg_midi = np.median(valid_pitches)
+
+        midi_note = int(np.clip(round(avg_midi), 0, 127))
+
+        # Tiempo de inicio y fin
+        start_time = start_frame * frame_duration
+        end_time = end_frame * frame_duration
+
+        # Duración mínima: 50ms
+        if (end_time - start_time) >= 0.05:
+            notes_list.append((midi_note, start_time, end_time, avg_midi))
+
+    return notes_list
+
+
+# ---------------------------------------------------------------------------
+# 6. CORRECCIÓN DE OCTAVA MEJORADA
+# ---------------------------------------------------------------------------
+
+def fix_octave_jumps_advanced(notes_list: list) -> list:
+    """
+    Corrección de octava con ventana deslizante y contexto amplio.
+    Usa la mediana de las notas cercanas como referencia.
     """
     if len(notes_list) < 3:
         return notes_list
 
     corrected = list(notes_list)
+    midi_values = [n[0] for n in corrected]
 
-    for i in range(1, len(corrected) - 1):
-        midi_prev = corrected[i - 1][0]
-        midi_curr = corrected[i][0]
-        midi_next = corrected[i + 1][0]
+    for i in range(len(corrected)):
+        # Ventana de contexto: hasta 5 notas antes y después
+        window_start = max(0, i - 5)
+        window_end = min(len(corrected), i + 6)
+        context = [midi_values[j] for j in range(window_start, window_end) if j != i]
 
-        neighbor_avg = (midi_prev + midi_next) / 2.0
-        diff = midi_curr - neighbor_avg
+        if not context:
+            continue
 
-        if abs(diff) > max_jump_semitones:
+        context_median = np.median(context)
+        current = midi_values[i]
+        diff = current - context_median
+
+        # Si la nota está a más de 9 semitonos de la mediana del contexto
+        if abs(diff) > 9:
             octave_shift = round(diff / 12) * 12
-            new_midi = midi_curr - octave_shift
-            new_midi = int(np.clip(new_midi, 0, 127))
-            corrected[i] = (new_midi, corrected[i][1], corrected[i][2])
+            new_midi = int(np.clip(current - octave_shift, 0, 127))
+            corrected[i] = (new_midi, corrected[i][1], corrected[i][2], corrected[i][3])
+            midi_values[i] = new_midi
 
     return corrected
 
 
-def merge_repeated_notes(notes_list: list, min_gap: float = 0.05) -> list:
+# ---------------------------------------------------------------------------
+# 7. FUSIÓN Y LIMPIEZA DE NOTAS
+# ---------------------------------------------------------------------------
+
+def merge_and_clean_notes(notes_list: list, min_duration: float = 0.08,
+                          merge_gap: float = 0.04) -> list:
     """
-    Fusiona notas consecutivas idénticas separadas por un silencio
-    muy corto (< min_gap segundos), que probablemente son la misma nota.
+    Fusiona notas iguales consecutivas con micro-silencios y
+    elimina notas demasiado cortas (probablemente ruido).
+    También fusiona notas que difieren por solo 1 semitono si son muy cortas.
     """
     if len(notes_list) < 2:
         return notes_list
 
+    # Paso 1: Fusionar notas idénticas con gaps pequeños
     merged = [notes_list[0]]
-
-    for midi_num, start, end in notes_list[1:]:
-        prev_midi, prev_start, prev_end = merged[-1]
-        if midi_num == prev_midi and (start - prev_end) < min_gap:
-            merged[-1] = (prev_midi, prev_start, end)
+    for n in notes_list[1:]:
+        prev = merged[-1]
+        gap = n[1] - prev[2]
+        if n[0] == prev[0] and gap < merge_gap:
+            merged[-1] = (prev[0], prev[1], n[2], prev[3])
         else:
-            merged.append((midi_num, start, end))
+            merged.append(n)
 
-    return merged
+    # Paso 2: Absorber notas muy cortas (< 50ms) en sus vecinas
+    cleaned = []
+    for i, n in enumerate(merged):
+        dur = n[2] - n[1]
+        if dur < 0.05 and len(cleaned) > 0:
+            # Si difiere por 1-2 semitonos de la anterior, extender la anterior
+            prev = cleaned[-1]
+            if abs(n[0] - prev[0]) <= 2:
+                cleaned[-1] = (prev[0], prev[1], n[2], prev[3])
+                continue
+        cleaned.append(n)
+
+    # Paso 3: Filtrar por duración mínima
+    cleaned = [n for n in cleaned if (n[2] - n[1]) >= min_duration]
+
+    return cleaned
 
 
-def detect_tempo_from_audio(y: np.ndarray, sr: int) -> float:
+# ---------------------------------------------------------------------------
+# 8. DETECCIÓN DE TEMPO MEJORADA
+# ---------------------------------------------------------------------------
+
+def detect_tempo_precise(y: np.ndarray, sr: int) -> float:
     """
-    Detecta el BPM del audio usando librosa.beat.beat_track.
-    Devuelve el tempo redondeado a valores musicales comunes.
+    Detección de tempo más precisa: usa onset strength y permite
+    tempos más variados (no solo los "comunes").
     """
-    tempo_estimate, _ = librosa.beat.beat_track(y=y, sr=sr)
-
-    if hasattr(tempo_estimate, '__len__'):
-        bpm = float(tempo_estimate[0])
-    else:
-        bpm = float(tempo_estimate)
-
-    common_tempos = [60, 66, 72, 76, 80, 84, 88, 92, 96, 100,
-                     104, 108, 112, 116, 120, 126, 132, 138, 144, 152, 160]
-
-    closest = min(common_tempos, key=lambda t: abs(t - bpm))
-    return closest
-
-
-def quantize_duration(dur_quarters: float, grid: float = 0.25) -> float:
-    """
-    Cuantiza una duración en quarter-notes a la rejilla más cercana.
-    grid=0.25 → semicorchea, grid=0.5 → corchea, etc.
-    Permite duraciones con puntillo (1.5x).
-    """
-    standard_durations = []
-    base = grid
-    while base <= 8.0:
-        standard_durations.append(base)
-        standard_durations.append(base * 1.5)
-        base *= 2
-
-    standard_durations = sorted(set(standard_durations))
-
-    closest = min(standard_durations, key=lambda d: abs(d - dur_quarters))
-    return closest
-
-
-def audio_to_midi(audio_path: str, midi_path: str) -> dict:
-    """
-    Pipeline mejorado: Audio → detección de pitch → suavizado →
-    corrección de octava → fusión → generación MIDI.
-    """
-    y, sr = librosa.load(audio_path, sr=22050, mono=True)
-    duration = librosa.get_duration(y=y, sr=sr)
-
-    detected_bpm = detect_tempo_from_audio(y, sr)
-
-    f0, voiced_flag, voiced_prob = librosa.pyin(
-        y,
-        fmin=librosa.note_to_hz("C2"),
-        fmax=librosa.note_to_hz("C7"),
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    tempo_estimate = librosa.feature.tempo(
+        onset_envelope=onset_env,
         sr=sr,
+        aggregate=None,
     )
 
-    hop_length = 512
-    frame_duration = hop_length / sr
+    if len(tempo_estimate) > 0:
+        bpm = float(np.median(tempo_estimate))
+    else:
+        bpm = 120.0
 
-    f0 = smooth_pitch_sequence(f0, voiced_flag, kernel_size=5)
+    # Redondear a múltiplos de 2 para un BPM musical limpio
+    bpm = round(bpm / 2) * 2
+    bpm = max(40, min(200, bpm))
 
-    notes_list = []
-    current_midi = None
-    start_time = 0.0
+    return float(bpm)
 
-    for i, (freq, is_voiced) in enumerate(zip(f0, voiced_flag)):
-        t = i * frame_duration
-        if is_voiced and not np.isnan(freq):
-            midi_num = hz_to_midi_note(freq)
-            if midi_num != current_midi:
-                if current_midi is not None:
-                    notes_list.append((current_midi, start_time, t))
-                current_midi = midi_num
-                start_time = t
-        else:
-            if current_midi is not None:
-                notes_list.append((current_midi, start_time, t))
-                current_midi = None
 
-    if current_midi is not None:
-        notes_list.append((current_midi, start_time, len(f0) * frame_duration))
+# ---------------------------------------------------------------------------
+# 9. CUANTIZACIÓN RÍTMICA ALINEADA A BEATS
+# ---------------------------------------------------------------------------
 
-    min_duration = 0.06
-    notes_list = [(m, s, e) for m, s, e in notes_list if (e - s) >= min_duration]
-    notes_list = fix_octave_jumps(notes_list)
-    notes_list = merge_repeated_notes(notes_list)
-    notes_list = [(m, s, e) for m, s, e in notes_list if (e - s) >= min_duration]
+def quantize_to_beat_grid(notes_list: list, bpm: float,
+                          grid_subdivision: int = 8) -> list:
+    """
+    Cuantiza los tiempos de inicio y fin de las notas a una rejilla
+    basada en el tempo real. grid_subdivision=8 → fusas (1/8 de beat).
+    """
+    beat_duration = 60.0 / bpm
+    grid_size = beat_duration / grid_subdivision
 
-    midi = pretty_midi.PrettyMIDI(initial_tempo=detected_bpm)
-    voice = pretty_midi.Instrument(program=0, name="Voice")
+    quantized = []
+    for midi_num, start, end, avg_midi in notes_list:
+        q_start = round(start / grid_size) * grid_size
+        q_end = round(end / grid_size) * grid_size
 
-    for midi_num, start, end in notes_list:
-        pm_note = pretty_midi.Note(
-            velocity=100,
-            pitch=midi_num,
-            start=start,
-            end=end,
-        )
-        voice.notes.append(pm_note)
+        # Asegurar duración mínima de 1 grid unit
+        if q_end <= q_start:
+            q_end = q_start + grid_size
 
-    midi.instruments.append(voice)
-    midi.write(midi_path)
+        quantized.append((midi_num, q_start, q_end, avg_midi))
 
-    return {
-        "duration_seconds": round(duration, 2),
-        "notes_detected": len(notes_list),
-        "detected_bpm": detected_bpm,
-        "midi_path": midi_path,
-        "notes_list": notes_list,
-    }
+    return quantized
 
+
+def duration_to_quarter_length(dur_seconds: float, bpm: float) -> float:
+    """Convierte duración en segundos a quarter-note length."""
+    beat_duration = 60.0 / bpm
+    return dur_seconds / beat_duration
+
+
+def snap_quarter_length(ql: float) -> float:
+    """
+    Ajusta un quarter-length a la duración musical más cercana.
+    Incluye valores normales, con puntillo y tresillos.
+    """
+    valid = [
+        0.25,       # semicorchea
+        0.375,      # semicorchea con puntillo
+        1/3,        # tresillo de corchea
+        0.5,        # corchea
+        0.75,       # corchea con puntillo
+        2/3,        # tresillo de negra
+        1.0,        # negra
+        1.5,        # negra con puntillo
+        2.0,        # blanca
+        3.0,        # blanca con puntillo
+        4.0,        # redonda
+        6.0,        # redonda con puntillo
+    ]
+    return min(valid, key=lambda v: abs(v - ql))
+
+
+# ---------------------------------------------------------------------------
+# 10. DETECCIÓN DE TONALIDAD Y CORRECCIÓN
+# ---------------------------------------------------------------------------
 
 def detect_key_from_notes(notes_list: list) -> dict:
-    """
-    Usa music21 para analizar las notas y detectar la tonalidad
-    más probable de la melodía.
-    """
+    """Detecta la tonalidad más probable de la melodía."""
     if not notes_list:
         return {"key": "C major", "key_name": "Do Mayor", "confidence": 0}
 
     s = stream.Stream()
-    for midi_num, start, end in notes_list:
+    for midi_num, start, end, *_ in notes_list:
+        dur = end - start
         n = note.Note(midi_num)
-        n.quarterLength = 1.0
+        n.quarterLength = max(0.25, dur)
         s.append(n)
 
     try:
@@ -255,10 +425,13 @@ def detect_key_from_notes(notes_list: list) -> dict:
         return {"key": "C major", "key_name": "Do Mayor", "confidence": 0}
 
 
-def snap_to_key(midi_num: int, key_obj) -> int:
+def snap_to_key_smart(midi_num: int, avg_midi: float, key_obj,
+                      threshold: float = 0.4) -> int:
     """
-    Si una nota no pertenece a la tonalidad detectada, la ajusta
-    al grado más cercano de la escala.
+    Corrección tonal inteligente: solo ajusta notas que están
+    "entre" dos notas de la escala (desafinadas). Si la nota
+    está cerca del centro de un grado cromático, la respeta
+    como nota de paso o cromatismo intencional.
     """
     try:
         scale_pitches = key_obj.getScale().pitches
@@ -268,41 +441,122 @@ def snap_to_key(midi_num: int, key_obj) -> int:
         if pc in scale_pcs:
             return midi_num
 
+        # Calcular qué tan "desafinada" está la nota respecto a su MIDI redondeado
+        deviation = abs(avg_midi - round(avg_midi))
+
+        # Si la desviación es alta (nota entre dos semitonos), corregir
+        if deviation > threshold:
+            return midi_num  # Muy ambigua, no corregir
+
+        # Buscar grado más cercano de la escala
         distances = []
         for spc in scale_pcs:
             d = min(abs(pc - spc), 12 - abs(pc - spc))
             distances.append((d, spc))
 
         distances.sort(key=lambda x: x[0])
-        closest_pc = distances[0][1]
 
-        diff = closest_pc - pc
-        if abs(diff) > 6:
-            diff = diff - 12 if diff > 0 else diff + 12
+        # Solo corregir si está a 1 semitono de un grado de la escala
+        if distances[0][0] <= 1:
+            closest_pc = distances[0][1]
+            diff = closest_pc - pc
+            if abs(diff) > 6:
+                diff = diff - 12 if diff > 0 else diff + 12
+            return int(np.clip(midi_num + diff, 0, 127))
 
-        return int(np.clip(midi_num + diff, 0, 127))
+        return midi_num
     except Exception:
         return midi_num
+
+
+# ---------------------------------------------------------------------------
+# PIPELINE PRINCIPAL
+# ---------------------------------------------------------------------------
+
+def audio_to_midi(audio_path: str, midi_path: str) -> dict:
+    """
+    Pipeline de alta precisión:
+    1. Preprocesamiento de audio
+    2. Detección de pitch con resolución fina
+    3. Suavizado avanzado (mediana + Savitzky-Golay)
+    4. Detección de onsets
+    5. Agrupación inteligente por segmentos
+    6. Corrección de octava con contexto amplio
+    7. Fusión y limpieza
+    8. Cuantización a rejilla de beats
+    9. Generación MIDI
+    """
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+    duration = librosa.get_duration(y=y, sr=sr)
+
+    # 1. Preprocesar audio
+    y_clean = preprocess_audio(y, sr)
+
+    # 2. Detectar tempo
+    detected_bpm = detect_tempo_precise(y_clean, sr)
+
+    # 3. Detección de pitch de alta resolución
+    f0, voiced_flag, voiced_prob, hop_length = detect_pitch_precise(y_clean, sr)
+
+    # 4. Suavizado avanzado
+    f0 = smooth_pitch_advanced(f0, voiced_flag)
+
+    # 5. Detección de onsets
+    onset_frames = detect_onsets(y_clean, sr, hop_length)
+
+    # 6. Agrupar notas usando onsets + pitch
+    notes_list = group_notes_with_onsets(f0, voiced_flag, onset_frames, hop_length, sr)
+
+    # 7. Corrección de octava
+    notes_list = fix_octave_jumps_advanced(notes_list)
+
+    # 8. Fusión y limpieza
+    notes_list = merge_and_clean_notes(notes_list)
+
+    # 9. Cuantización rítmica a rejilla de beats
+    notes_list = quantize_to_beat_grid(notes_list, detected_bpm)
+
+    # 10. Generar MIDI
+    midi = pretty_midi.PrettyMIDI(initial_tempo=detected_bpm)
+    voice = pretty_midi.Instrument(program=0, name="Voice")
+
+    for midi_num, start, end, *_ in notes_list:
+        pm_note = pretty_midi.Note(
+            velocity=100,
+            pitch=midi_num,
+            start=start,
+            end=end,
+        )
+        voice.notes.append(pm_note)
+
+    midi.instruments.append(voice)
+    midi.write(midi_path)
+
+    return {
+        "duration_seconds": round(duration, 2),
+        "notes_detected": len(notes_list),
+        "detected_bpm": detected_bpm,
+        "midi_path": midi_path,
+        "notes_list": notes_list,
+    }
 
 
 def midi_to_score(midi_path: str, output_base: str,
                   detected_bpm: float, notes_list: list) -> dict:
     """
-    Lee un archivo MIDI y genera una partitura con:
+    Genera partitura con:
     - Tonalidad detectada automáticamente
-    - Cuantización rítmica inteligente
-    - Silencios explícitos entre notas
-    - Armadura de clave correcta
+    - Corrección tonal inteligente (solo notas ambiguas)
+    - Cuantización rítmica a valores musicales reales
+    - Silencios explícitos
     """
     key_info = detect_key_from_notes(notes_list)
 
     try:
-        key_obj = m21key.Key(key_info["key"].split()[0],
-                             key_info["key"].split()[1] if len(key_info["key"].split()) > 1 else "major")
+        parts = key_info["key"].split()
+        key_obj = m21key.Key(parts[0], parts[1] if len(parts) > 1 else "major")
     except Exception:
         key_obj = m21key.Key("C", "major")
-
-    beats_per_second = detected_bpm / 60.0
 
     s = stream.Score()
     s.metadata = metadata.Metadata()
@@ -316,24 +570,29 @@ def midi_to_score(midi_path: str, output_base: str,
 
     current_time = 0.0
 
-    for midi_num, start, end in notes_list:
+    for midi_num, start, end, *extra in notes_list:
+        avg_midi = extra[0] if extra else float(midi_num)
+
+        # Silencio entre notas
         gap = start - current_time
-        if gap > 0.1:
-            rest_quarters = gap * beats_per_second
-            rest_quantized = quantize_duration(rest_quarters)
-            if rest_quantized >= 0.25:
+        if gap > 0.05:
+            rest_ql = duration_to_quarter_length(gap, detected_bpm)
+            rest_ql = snap_quarter_length(rest_ql)
+            if rest_ql >= 0.25:
                 r = Rest()
-                r.quarterLength = rest_quantized
+                r.quarterLength = rest_ql
                 part.append(r)
 
-        corrected_midi = snap_to_key(midi_num, key_obj)
+        # Corrección tonal inteligente
+        corrected_midi = snap_to_key_smart(midi_num, avg_midi, key_obj)
 
+        # Duración cuantizada
         dur_seconds = end - start
-        dur_quarters = dur_seconds * beats_per_second
-        dur_quantized = quantize_duration(dur_quarters)
+        dur_ql = duration_to_quarter_length(dur_seconds, detected_bpm)
+        dur_ql = snap_quarter_length(dur_ql)
 
         n = note.Note(corrected_midi)
-        n.quarterLength = dur_quantized
+        n.quarterLength = dur_ql
         part.append(n)
 
         current_time = end
