@@ -262,6 +262,120 @@ body {
     border-radius: var(--radius-sm);
 }
 
+/* ---- BPM Selector ---- */
+.bpm-selector {
+    margin-bottom: 1.25rem;
+    padding: 1rem;
+    background: var(--gray-50);
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius-sm);
+}
+
+.bpm-label {
+    display: block;
+    margin-bottom: 0.75rem;
+}
+
+.bpm-title {
+    display: block;
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: var(--gray-700);
+}
+
+.bpm-hint {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--gray-400);
+    margin-top: 0.15rem;
+}
+
+.bpm-controls {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.bpm-toggle {
+    flex: 1;
+    padding: 0.5rem 1rem;
+    border: 2px solid var(--gray-300);
+    border-radius: var(--radius-sm);
+    background: white;
+    font-family: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--gray-600);
+    cursor: pointer;
+    transition: all var(--transition);
+}
+
+.bpm-toggle:hover {
+    border-color: var(--primary);
+    color: var(--primary);
+}
+
+.bpm-toggle.active {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: white;
+}
+
+.bpm-input-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    justify-content: center;
+}
+
+.bpm-btn {
+    width: 40px;
+    height: 40px;
+    border: 2px solid var(--gray-300);
+    border-radius: var(--radius-sm);
+    background: white;
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--gray-600);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all var(--transition);
+    font-family: inherit;
+}
+
+.bpm-btn:hover {
+    border-color: var(--primary);
+    color: var(--primary);
+    background: var(--primary-light);
+}
+
+.bpm-input {
+    width: 80px;
+    height: 40px;
+    text-align: center;
+    font-family: inherit;
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--gray-800);
+    border: 2px solid var(--gray-300);
+    border-radius: var(--radius-sm);
+    outline: none;
+    transition: border-color var(--transition);
+    -moz-appearance: textfield;
+}
+
+.bpm-input::-webkit-outer-spin-button,
+.bpm-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.bpm-input:focus {
+    border-color: var(--primary);
+}
+
 /* ---- Buttons ---- */
 .btn {
     display: inline-flex;

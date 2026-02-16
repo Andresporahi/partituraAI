@@ -70,10 +70,18 @@ def upload_audio():
     file.save(audio_path)
 
     try:
+        # Leer BPM del usuario (opcional)
+        user_bpm = request.form.get("bpm", None)
+        if user_bpm:
+            try:
+                user_bpm = float(user_bpm)
+            except (ValueError, TypeError):
+                user_bpm = None
+
         # Paso 1: Audio → MIDI
         midi_filename = f"{job_id}.mid"
         midi_path = os.path.join(OUTPUT_FOLDER, midi_filename)
-        midi_stats = audio_to_midi(audio_path, midi_path)
+        midi_stats = audio_to_midi(audio_path, midi_path, user_bpm=user_bpm)
 
         # Paso 2: MIDI → Partitura
         output_base = os.path.join(OUTPUT_FOLDER, job_id)

@@ -72,6 +72,23 @@
                     <audio id="audioElement" controls></audio>
                 </div>
 
+                <!-- BPM Selector -->
+                <div class="bpm-selector" id="bpmSelector">
+                    <label class="bpm-label">
+                        <span class="bpm-title">BPM (tempo)</span>
+                        <span class="bpm-hint">Deja en "Auto" para detectar automáticamente</span>
+                    </label>
+                    <div class="bpm-controls">
+                        <button class="bpm-toggle" id="bpmToggleAuto" type="button">Auto</button>
+                        <button class="bpm-toggle" id="bpmToggleManual" type="button">Manual</button>
+                    </div>
+                    <div class="bpm-input-wrapper" id="bpmInputWrapper" hidden>
+                        <button class="bpm-btn" id="bpmMinus" type="button">-</button>
+                        <input type="number" class="bpm-input" id="bpmInput" min="30" max="300" value="120" step="1">
+                        <button class="bpm-btn" id="bpmPlus" type="button">+</button>
+                    </div>
+                </div>
+
                 <button class="btn btn-primary btn-lg" id="btnConvert" disabled>
                     <svg class="btn-icon" viewBox="0 0 24 24" fill="none">
                         <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z" fill="currentColor"/>

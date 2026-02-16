@@ -37,7 +37,16 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnNewConversion = document.getElementById("btnNewConversion");
     const btnRetry = document.getElementById("btnRetry");
 
+    // BPM controls
+    const bpmToggleAuto = document.getElementById("bpmToggleAuto");
+    const bpmToggleManual = document.getElementById("bpmToggleManual");
+    const bpmInputWrapper = document.getElementById("bpmInputWrapper");
+    const bpmInput = document.getElementById("bpmInput");
+    const bpmMinus = document.getElementById("bpmMinus");
+    const bpmPlus = document.getElementById("bpmPlus");
+
     let selectedFile = null;
+    let bpmMode = "auto"; // "auto" or "manual"
 
     // ---- Helpers ----
     function formatFileSize(bytes) {
@@ -152,6 +161,34 @@ document.addEventListener("DOMContentLoaded", () => {
         clearFile();
     });
 
+    // ---- BPM Controls ----
+    bpmToggleAuto.classList.add("active");
+
+    bpmToggleAuto.addEventListener("click", () => {
+        bpmMode = "auto";
+        bpmToggleAuto.classList.add("active");
+        bpmToggleManual.classList.remove("active");
+        bpmInputWrapper.hidden = true;
+    });
+
+    bpmToggleManual.addEventListener("click", () => {
+        bpmMode = "manual";
+        bpmToggleManual.classList.add("active");
+        bpmToggleAuto.classList.remove("active");
+        bpmInputWrapper.hidden = false;
+        bpmInput.focus();
+    });
+
+    bpmMinus.addEventListener("click", () => {
+        let val = parseInt(bpmInput.value) || 120;
+        bpmInput.value = Math.max(30, val - 1);
+    });
+
+    bpmPlus.addEventListener("click", () => {
+        let val = parseInt(bpmInput.value) || 120;
+        bpmInput.value = Math.min(300, val + 1);
+    });
+
     // ---- Conversion ----
     async function startConversion() {
         if (!selectedFile) return;
@@ -160,12 +197,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const steps = [
             { text: "Subiendo archivo de audio...", progress: 10 },
-            { text: "Detectando tempo del audio...", progress: 20 },
-            { text: "Analizando frecuencias vocales (pYIN)...", progress: 35 },
-            { text: "Suavizando pitch y corrigiendo octavas...", progress: 50 },
-            { text: "Detectando tonalidad musical...", progress: 65 },
-            { text: "Cuantizando ritmo y generando MIDI...", progress: 78 },
-            { text: "Creando partitura musical...", progress: 90 },
+            { text: "Analizando pitch con CREPE (IA)...", progress: 25 },
+            { text: "Detectando energía y silencios reales...", progress: 40 },
+            { text: "Extrayendo notas estables de la voz...", progress: 55 },
+            { text: "Corrigiendo octavas y fusionando...", progress: 70 },
+            { text: "Cuantizando ritmo y generando MIDI...", progress: 82 },
+            { text: "Creando partitura musical...", progress: 92 },
         ];
 
         let stepIndex = 0;
@@ -180,6 +217,12 @@ document.addEventListener("DOMContentLoaded", () => {
         try {
             const formData = new FormData();
             formData.append("audio", selectedFile);
+            if (bpmMode === "manual") {
+                const bpmVal = parseInt(bpmInput.value);
+                if (bpmVal >= 30 && bpmVal <= 300) {
+                    formData.append("bpm", bpmVal);
+                }
+            }
 
             const response = await fetch("/api/upload", {
                 method: "POST",
